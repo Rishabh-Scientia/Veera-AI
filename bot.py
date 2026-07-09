@@ -11,11 +11,17 @@ from typing import Any, List, Dict, Optional
 from groq import AsyncGroq
 from dotenv import load_dotenv
 
+from fastapi.responses import RedirectResponse
+
 # Load environment variables from .env
 load_dotenv()
 
 app = FastAPI()
 START_TIME = time.time()
+
+@app.get("/")
+async def root_redirect():
+    return RedirectResponse(url="/docs")
 
 # In-memory context stores
 # Key: (scope, context_id) -> Value: {"version": int, "payload": dict}
