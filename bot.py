@@ -107,6 +107,15 @@ class CtxBody(BaseModel):
     delivered_at: str
 
 
+class ReplyBody(BaseModel):
+    conversation_id: str
+    merchant_id: Optional[str] = None
+    from_role: str
+    message: str
+    received_at: str
+    turn_number: int = 1
+
+
 @app.get("/v1/healthz")
 async def healthz():
     counts = {"category": 0, "merchant": 0, "customer": 0, "trigger": 0}
