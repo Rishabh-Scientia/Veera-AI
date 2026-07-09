@@ -1,0 +1,16 @@
+.env
+venv/
+.venv/
+__pycache__/
+*.log
+assignment_project/
+challenge-brief.md
+challenge-testing-brief.md
+engagement-design.md
+engagement-research.md
+explanation.txt
+judge_simulator.py
+test_gemini.py
+test_groq.py
+desktop.ini
+magicpin-ai-challenge.zip
