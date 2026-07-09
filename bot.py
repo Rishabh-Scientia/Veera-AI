@@ -8,7 +8,7 @@ from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Any, List, Dict, Optional
-from groq import AsyncGroq
+from groq import AsyncGroq, Groq
 from dotenv import load_dotenv
 
 from fastapi.responses import RedirectResponse
@@ -106,14 +106,6 @@ class CtxBody(BaseModel):
     payload: Dict[str, Any]
     delivered_at: str
 
-
-class ReplyBody(BaseModel):
-    conversation_id: str
-    merchant_id: Optional[str] = None
-    from_role: str
-    message: str
-    received_at: str
-    turn_number: int = 1
 
 
 @app.get("/v1/healthz")
