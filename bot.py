@@ -124,11 +124,11 @@ async def healthz():
 @app.get("/v1/metadata")
 async def metadata():
     return {
-        "team_name": "Antigravity Team",
-        "team_members": ["Antigravity"],
+        "team_name": "Rishabh Yadav",
+        "team_members": ["Rishabh Yadav"],
         "model": os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
         "approach": "Context-aware WhatsApp prompt composer with auto-reply filter and intent transition state machine",
-        "contact_email": "antigravity@magicpin.com",
+        "contact_email": "rishabhydav@magicpin.com",
         "version": "1.0.0",
         "submitted_at": datetime.utcnow().isoformat() + "Z"
     }
