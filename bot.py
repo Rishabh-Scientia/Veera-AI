@@ -137,9 +137,6 @@ async def metadata():
 @app.post("/v1/context")
 async def push_context(body: CtxBody):
     key = (body.scope, body.context_id)
-    cur = contexts.get(key)
-    if cur and cur["version"] > body.version:
-        return {"accepted": False, "reason": "stale_version", "current_version": cur["version"]}
     contexts[key] = {"version": body.version, "payload": body.payload}
     return {
         "accepted": True,
