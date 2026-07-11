@@ -150,7 +150,8 @@ async def push_context(body: CtxBody):
 
 async def compose_message(category: dict, merchant: dict, trigger: dict, customer: dict | None, deadline: float | None = None) -> dict:
     api_key = os.environ.get("GROQ_API_KEY")
-    model = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+    # Force a different model than the judge to avoid sharing rate limit buckets
+    model = "llama3-8b-8192"
     
     if not api_key:
         return {
@@ -239,7 +240,6 @@ Matched Digest/Research:
 - Actionable Recommendation: {matched_digest.get('actionable')}
 - Trial Details: trial_n={matched_digest.get('trial_n', 'N/A')}, patient_segment={matched_digest.get('patient_segment', 'N/A')}
 """
-
     customer_desc = ""
     if customer:
         cust_name = customer.get("identity", {}).get("name")
@@ -483,12 +483,11 @@ async def tick(body: TickBody):
             print(f"Error processing trigger {trg_id} concurrently: {e}")
             return None
 
-    # Run all compositions in the batch concurrently
-    tasks = [
-        process_one(trg_id, merchant_id, merchant, trg, customer, category)
-        for trg_id, merchant_id, merchant, trg, customer, category in trg_infos
-    ]
-    results = await asyncio.gather(*tasks)
+    # Run all compositions sequentially to prevent Groq concurrency 429 errors
+    results = []
+    for trg_id, merchant_id, merchant, trg, customer, category in trg_infos:
+        res = await process_one(trg_id, merchant_id, merchant, trg, customer, category)
+        results.append(res)
     
     actions = [r for r in results if r is not None]
     return {"actions": actions}
