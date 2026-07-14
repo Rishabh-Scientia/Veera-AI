@@ -281,6 +281,8 @@ async def enforce_length_and_citation(
                 f'You MUST include this exact citation verbatim somewhere in the message: "{required_citation}"'
             )
         instructions.append(f"Keep the action link '{action_url}' present in the message.")
+        instructions.append("CRITICAL: Preserve ALL exact numbers, metrics (views/calls/CTR), patient counts, and dates from the original message.")
+        instructions.append("CRITICAL: The final sentence MUST be exactly the Call to Action from the original message.")
         instructions.append("Return ONLY the corrected message text. No quotes, no markdown, no preamble.")
 
         repair_prompt = (
@@ -729,15 +731,15 @@ different compulsion lever and a different opening line than these):
         slots_for_cta = digest_payload.get("available_slots", []) or digest_payload.get("next_session_options", [])
         slot_labels_cta = [s.get("label", "") for s in slots_for_cta if s.get("label")]
         if len(slot_labels_cta) >= 2:
-            suggested_cta = f"Reply 1 for {slot_labels_cta[0]}, 2 for {slot_labels_cta[1]}"
+            suggested_cta = f"Reply 1 to book {slot_labels_cta[0]}, or 2 for {slot_labels_cta[1]} before slots fill up!"
         elif slot_labels_cta:
-            suggested_cta = f"Reply GO to book {slot_labels_cta[0]}"
+            suggested_cta = f"Reply GO to secure {slot_labels_cta[0]} before it's taken!"
         else:
-            suggested_cta = "Reply GO to confirm your appointment"
+            suggested_cta = "Reply GO to confirm your appointment and keep your spot!"
     elif kind == "research_digest":
-        suggested_cta = "Want me to flag your high-risk patients for the shorter recall? Reply GO"
+        suggested_cta = "Want me to flag your high-risk patients for this recall before competitors do? Reply GO"
     elif kind == "regulation_change":
-        suggested_cta = "Should I run the compliance checklist for your clinic? Reply GO"
+        suggested_cta = "Should I run the compliance checklist to avoid any penalties? Reply GO"
     elif kind in ("perf_dip", "seasonal_perf_dip"):
         suggested_cta = "Want me to draft 3 recovery posts for your profile? Reply GO"
     elif kind == "renewal_due":
@@ -845,16 +847,25 @@ CONTEXT:
 - Trigger: {kind} | Urgency: {urgency}/5
 - Recipient: {customer_desc.strip() if customer_desc else 'No customer — speak AS Vera to ' + owner_title}
 
-★ WHY_NOW (MUST state in your FIRST sentence): {why_now}
-★ LOSS_HOOK (MUST weave into your SECOND sentence): {loss_hook}
+★ WHY_NOW (MUST state early in message): {why_now}
+★ LOSS_HOOK (MUST weave into message to create high urgency): {loss_hook}
 {matched_digest_desc}
-=== MUST-CITE DATA (you MUST weave at least 3 of these into your message body) ===
+=== MUST-CITE DATA (you MUST weave ALL of these into your message body) ===
 {must_cite_block}
+{f"★ EXACT CITATION TO INCLUDE VERBATIM: '{required_citation}'" if required_citation else ""}
 
-=== CTA (must be the LAST sentence of your message) ===
+=== CTA (must be the EXACT LAST sentence of your message) ===
 {suggested_cta}
+
 {prior_sent_desc}
-RULES: Aim 200-250 chars (max {SAFE_BODY_LENGTH}). EXACTLY 3 sentences: (1) Greeting + WHY_NOW + key data, (2) LOSS_HOOK, (3) CTA ending "Reply GO". No http/https URLs. {'WRITE IN HINGLISH — Hindi+English mixed.' if prefers_hinglish else ''} Taboo: {category.get('voice', {}).get('vocab_taboo', [])}
+RULES: 
+1. Aim 200-250 chars (max {SAFE_BODY_LENGTH}). EXACTLY 3 sentences.
+2. SPECIFICITY: Include the EXACT citation '{required_citation}' verbatim (with quotes if provided) to pass the citation check.
+3. MERCHANT FIT: Personalize with their EXACT performance metrics (views, calls, CTR) or patient counts.
+4. ENGAGEMENT & RELEVANCE: Heavily emphasize the LOSS HOOK and WHY NOW. Create intense urgency/FOMO!
+5. The message MUST end with exactly the provided CTA. No http/https URLs. 
+{'6. WRITE IN HINGLISH — Hindi+English mixed.' if prefers_hinglish else ''}
+Taboo: {category.get('voice', {}).get('vocab_taboo', [])}
 Return ONLY raw JSON: {{"body":"...","cta":"binary","send_as":"{'merchant_on_behalf' if customer else 'vera'}","rationale":"data points + WHY_NOW + LOSS_HOOK used"}}"""
 
     try:
@@ -895,7 +906,8 @@ Return ONLY raw JSON: {{"body":"...","cta":"binary","send_as":"{'merchant_on_beh
                         f"Rewrite it with a different opening line and a different compulsion lever "
                         f"(pick one you haven't used: social proof, curiosity, effort externalization, "
                         f"reciprocity, or asking the merchant a light question), keeping the same facts, "
-                        f"the same action link ({action_url}), and staying strictly under {SAFE_BODY_LENGTH} "
+                        f"CRITICAL: You MUST preserve ALL exact numbers, metrics (views/calls/CTR), patient counts, dates, and the exact source citation '{required_citation if required_citation else ''}' verbatim. "
+                        f"Keep the same action link ({action_url}), and stay strictly under {SAFE_BODY_LENGTH} "
                         f"characters. Return ONLY the corrected message text."
                     )
                     resp = await call_groq_with_retry(
