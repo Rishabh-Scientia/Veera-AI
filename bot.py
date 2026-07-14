@@ -29,7 +29,7 @@ REPLY_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 _groq_client: Optional[AsyncGroq] = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 MAX_BODY_LENGTH = 320
-SAFE_BODY_LENGTH = 300  # target we ask the model for, leaving buffer before the hard 320 cap
+SAFE_BODY_LENGTH = 280  # shorter target for punchier messages; hard cap stays 320
 
 
 @app.get("/")
@@ -683,6 +683,46 @@ different compulsion lever and a different opening line than these):
     must_cite_block = "\n".join(f"  - {item}" for item in must_cite_items)
 
     # =========================================================================
+    # Pre-compute WHY_NOW and LOSS_HOOK for the LLM prompt
+    # =========================================================================
+    _hrc = merchant.get("customer_aggregate", {}).get("high_risk_adult_count", 0)
+    why_now = {
+        "research_digest": f"New study: {(matched_digest or {}).get('title', 'latest research')[:55]}",
+        "regulation_change": f"Deadline {digest_payload.get('deadline_iso', 'approaching')} — compliance required",
+        "perf_dip": f"{digest_payload.get('metric', 'metrics')} dropped {abs(digest_payload.get('delta_pct', 0)):.0%} this week",
+        "seasonal_perf_dip": f"{digest_payload.get('metric', 'metrics')} dipped {abs(digest_payload.get('delta_pct', 0)):.0%} — seasonal but needs response",
+        "renewal_due": f"Plan expires in {digest_payload.get('days_remaining', '?')} days",
+        "recall_due": f"Service due {digest_payload.get('due_date', 'soon')} — slots filling",
+        "ipl_match_today": f"{digest_payload.get('match', 'Match')} tonight",
+        "winback_eligible": f"Offline {digest_payload.get('days_since_expiry', '?')} days — recovery window shrinking",
+        "competitor_opened": f"{digest_payload.get('competitor_name', 'Competitor')} just opened nearby",
+        "festival_upcoming": f"{digest_payload.get('festival', 'Festival')} in {digest_payload.get('days_until', '?')} days",
+        "milestone_reached": f"At {digest_payload.get('value_now', '?')} — milestone {digest_payload.get('milestone_value', '?')} imminent",
+        "review_theme_emerged": f"{digest_payload.get('occurrences_30d', '?')} mentions this month, trending up",
+        "supply_alert": f"Recall issued for {digest_payload.get('molecule', 'product')} — notify patients today",
+        "dormant_with_vera": f"No response in {digest_payload.get('days_since_last_merchant_message', '?')} days",
+        "active_planning_intent": f"Merchant agreed to {digest_payload.get('intent_topic', 'plan').replace('_', ' ')} — momentum is hot",
+    }.get(kind, f"Time-sensitive {kind.replace('_', ' ')} update")
+
+    loss_hook = {
+        "research_digest": f"Your {_hrc} high-risk patients may switch to clinics offering shorter recall" if _hrc else "Peers adopting early capture the segment first",
+        "regulation_change": "Non-compliant setups face penalties — peers already upgrading",
+        "perf_dip": "Every day without action = customers going to competitors",
+        "seasonal_perf_dip": "Competitors don't pause during seasonal dips — neither should you",
+        "renewal_due": "Lapsing loses ranking boost and offer visibility",
+        "recall_due": "Missing this window = patient won't rebook for months",
+        "winback_eligible": f"{digest_payload.get('lapsed_customers_added_since_expiry', 'Many')} customers lapsed since offline",
+        "competitor_opened": "They're actively pulling your customer base",
+        "festival_upcoming": "Late festive offers convert poorly — early movers win",
+        "milestone_reached": "So close — don't let momentum stall now",
+        "review_theme_emerged": "Each unaddressed review pushes customers to competitors",
+        "ipl_match_today": "Without a deal, you'll miss the match-night order rush",
+        "supply_alert": "Not notifying affected patients risks trust damage",
+        "dormant_with_vera": "Longer the gap, harder to re-engage",
+        "active_planning_intent": "Delay cools merchant interest — strike while hot",
+    }.get(kind, "Waiting means missing the optimal action window")
+
+    # =========================================================================
     # Pre-compute suggested CTA based on trigger kind
     # =========================================================================
     if customer:
@@ -691,56 +731,56 @@ different compulsion lever and a different opening line than these):
         if len(slot_labels_cta) >= 2:
             suggested_cta = f"Reply 1 for {slot_labels_cta[0]}, 2 for {slot_labels_cta[1]}"
         elif slot_labels_cta:
-            suggested_cta = f"Reply YES to book {slot_labels_cta[0]}"
+            suggested_cta = f"Reply GO to book {slot_labels_cta[0]}"
         else:
-            suggested_cta = "Reply YES to confirm your appointment"
+            suggested_cta = "Reply GO to confirm your appointment"
     elif kind == "research_digest":
-        suggested_cta = "Want me to flag your high-risk patients for the shorter recall? Reply YES"
+        suggested_cta = "Want me to flag your high-risk patients for the shorter recall? Reply GO"
     elif kind == "regulation_change":
-        suggested_cta = "Should I run the compliance checklist for your clinic? Reply YES"
+        suggested_cta = "Should I run the compliance checklist for your clinic? Reply GO"
     elif kind in ("perf_dip", "seasonal_perf_dip"):
-        suggested_cta = "Want me to draft 3 recovery posts for your profile? Reply YES"
+        suggested_cta = "Want me to draft 3 recovery posts for your profile? Reply GO"
     elif kind == "renewal_due":
-        suggested_cta = "Want me to lock in the renewal before it lapses? Reply YES"
+        suggested_cta = "Want me to lock in the renewal before it lapses? Reply GO"
     elif kind == "festival_upcoming":
-        suggested_cta = "Should I draft a festive offer post for your profile? Reply YES"
+        suggested_cta = "Should I draft a festive offer post for your profile? Reply GO"
     elif kind == "review_theme_emerged":
-        suggested_cta = "Want me to draft a response template for this? Reply YES"
+        suggested_cta = "Want me to draft a response template for this? Reply GO"
     elif kind == "milestone_reached":
-        suggested_cta = "Want me to create a milestone celebration post? Reply YES"
+        suggested_cta = "Want me to create a milestone celebration post? Reply GO"
     elif kind == "ipl_match_today":
-        suggested_cta = "Should I push a match-night deal to your followers? Reply YES"
+        suggested_cta = "Should I push a match-night deal to your followers? Reply GO"
     elif kind == "winback_eligible":
-        suggested_cta = "Want to restart with a comeback offer? Reply YES"
+        suggested_cta = "Want to restart with a comeback offer? Reply GO"
     elif kind == "supply_alert":
-        suggested_cta = "Want the affected customer list filtered now? Reply YES"
+        suggested_cta = "Want the affected customer list filtered now? Reply GO"
     elif kind == "competitor_opened":
-        suggested_cta = "Want me to strengthen your listing against theirs? Reply YES"
+        suggested_cta = "Want me to strengthen your listing against theirs? Reply GO"
     elif kind == "gbp_unverified":
-        suggested_cta = "I can start the verification — 5 min setup. Reply YES"
+        suggested_cta = "I can start the verification — 5 min setup. Reply GO"
     elif kind == "active_planning_intent":
-        suggested_cta = "I've drafted a plan — want me to send it? Reply YES"
+        suggested_cta = "I've drafted a plan — want me to send it? Reply GO"
     elif kind == "cde_opportunity":
-        suggested_cta = "Want me to register you? Reply YES"
+        suggested_cta = "Want me to register you? Reply GO"
     elif kind == "dormant_with_vera":
-        suggested_cta = "Quick check-in — want an update on your profile? Reply YES"
+        suggested_cta = "Quick check-in — want an update on your profile? Reply GO"
     elif kind == "perf_spike":
-        suggested_cta = "Want me to double down with a follow-up post? Reply YES"
+        suggested_cta = "Want me to double down with a follow-up post? Reply GO"
     elif kind == "category_seasonal":
-        suggested_cta = "Want me to update your seasonal display plan? Reply YES"
+        suggested_cta = "Want me to update your seasonal display plan? Reply GO"
     elif kind == "customer_lapsed_hard":
-        suggested_cta = "Want to come back and pick up where you left off? Reply YES"
+        suggested_cta = "Want to come back and pick up where you left off? Reply GO"
     elif kind == "trial_followup":
-        suggested_cta = "Ready to continue? Reply YES to book the next session"
+        suggested_cta = "Ready to continue? Reply GO to book the next session"
     elif kind == "wedding_package_followup":
-        suggested_cta = "Ready to start the prep program? Reply YES"
+        suggested_cta = "Ready to start the prep program? Reply GO"
     elif kind == "chronic_refill_due":
-        suggested_cta = "Want us to schedule the delivery? Reply YES"
+        suggested_cta = "Want us to schedule the delivery? Reply GO"
     else:
-        suggested_cta = "Reply YES and I'll handle it for you"
+        suggested_cta = "Reply GO and I'll handle it for you"
 
     system_prompt = f"""You are Vera, magicpin's Merchant AI Assistant.
-Your task is to write a highly compelling, specific, and context-appropriate WhatsApp message based on the provided business contexts.
+You write ultra-short, punchy WhatsApp messages (aim 200-250 chars) that make merchants REPLY. Structure: Sentence 1 = greeting + WHY NOW timing reason + key data. Sentence 2 = loss aversion / FOMO. Sentence 3 = effort-externalized CTA ending with "Reply GO".
 
 Recipient Rules:
 1. CUSTOMER EXISTENCE (customer_id is populated):
@@ -761,7 +801,7 @@ Recipient Rules:
    - **Specificity**: Cite EXACT facts, metrics, trial_n, patient_segment, or compliance deadlines from the trigger payload. You MUST include the exact Source Citation string verbatim (character-for-character, e.g. "— JIDA Oct 2026, p.14") if one is provided in the context — this is graded strictly, do not paraphrase or omit it.
    - **Merchant Fit**: Personalize by mentioning the merchant's EXACT performance numbers (Views, Calls, or CTR vs peer average).
    - **Trigger Relevance**: Explain why this matters NOW using the urgency level and any deadline in the trigger payload explicitly (state the date or days remaining).
-   - **Engagement**: The CTA MUST use Effort Externalization and a Single Binary Commitment. Do the work for them! (e.g., "Want me to update your profile? Reply YES" or "Should I draft a post? Reply YES"). Do NOT force them to click a link unless necessary.
+   - **Engagement**: CRITICAL — your message MUST create LOSS AVERSION or FOMO (what they lose by NOT acting NOW). Use phrases like "patients may switch", "window closing", "peers already ahead". The CTA MUST use Effort Externalization (you've already done the work, they just reply) + end with "Reply GO". NEVER just inform — always compel action.
    - **Tone discipline**: Even when citing clinical/technical facts, keep the sentence plain and conversational — avoid stacking multiple acronyms or bureaucratic phrasing in one sentence. Explain jargon in a few plain words the first time it's used.
 
 Compulsion Levers — weave in at least ONE beyond plain specificity, and rotate which one you
@@ -788,8 +828,8 @@ Anti-patterns — NEVER do these, they get penalized directly:
 General Constraints:
 1. SPECIFICITY: You MUST use concrete numbers, metrics (views/calls/CTR), dates, prices, and citations from the context in EVERY message.
 2. TONE: Be warm, welcoming, and conversational. Do not be overly formal, bureaucratic, or aggressive. Match the category's Voice Tone and Voice Register exactly.
-3. CONCISENESS & LENGTH: Keep the message under 3 sentences. The ENTIRE body MUST be strictly under {SAFE_BODY_LENGTH} characters — this is a hard requirement, not a suggestion. Count your characters before answering. You will be heavily penalized if you exceed {MAX_BODY_LENGTH} characters.
-4. HINGLISH: If prefers_hinglish is True, you MUST write heavily in Hinglish.
+3. CONCISENESS & LENGTH: EXACTLY 3 sentences. Aim for 200-250 characters total. Body MUST be under {SAFE_BODY_LENGTH} chars (hard cap {MAX_BODY_LENGTH}). SHORTER IS ALWAYS BETTER. Verbose messages score ZERO on engagement.
+4. HINGLISH: If prefers_hinglish is True, you MUST write in HINGLISH — mix Hindi and English naturally. Use Hindi greetings (Namaste), Hindi particles (hai, ke liye, mein, se, ka/ki), Hindi connectors (aur, toh, abhi). Example: "Dr. Meera, naya JIDA study kehta hai 3-month recall se caries 38% kam (JIDA Oct 2026, p.14). Aapke patients ke liye relevant. Maine list ready rakhi — Reply GO". NEVER write pure English when prefers_hinglish is True.
 5. TABOOS: Strictly avoid any words listed in Taboo Vocabulary.
 6. JSON OUTPUT: Respond ONLY with a raw JSON object containing the keys: body, cta, send_as, rationale. Do not wrap in markdown blocks like ```json.
 """
@@ -804,6 +844,9 @@ CONTEXT:
 - Active offer: {active_offer}
 - Trigger: {kind} | Urgency: {urgency}/5
 - Recipient: {customer_desc.strip() if customer_desc else 'No customer — speak AS Vera to ' + owner_title}
+
+★ WHY_NOW (MUST state in your FIRST sentence): {why_now}
+★ LOSS_HOOK (MUST weave into your SECOND sentence): {loss_hook}
 {matched_digest_desc}
 === MUST-CITE DATA (you MUST weave at least 3 of these into your message body) ===
 {must_cite_block}
@@ -811,9 +854,8 @@ CONTEXT:
 === CTA (must be the LAST sentence of your message) ===
 {suggested_cta}
 {prior_sent_desc}
-RULES: Under {SAFE_BODY_LENGTH} chars. 2-3 sentences. Weave in 3+ data points from MUST-CITE. Binary CTA as LAST sentence. No http/https URLs. Mention {action_url} as a page reference if relevant. Taboo words to avoid: {category.get('voice', {}).get('vocab_taboo', [])}
-In the rationale field, list which 3+ data points you embedded.
-Return ONLY raw JSON (no markdown): {{"body":"...","cta":"binary","send_as":"{'merchant_on_behalf' if customer else 'vera'}","rationale":"..."}}"""
+RULES: Aim 200-250 chars (max {SAFE_BODY_LENGTH}). EXACTLY 3 sentences: (1) Greeting + WHY_NOW + key data, (2) LOSS_HOOK, (3) CTA ending "Reply GO". No http/https URLs. {'WRITE IN HINGLISH — Hindi+English mixed.' if prefers_hinglish else ''} Taboo: {category.get('voice', {}).get('vocab_taboo', [])}
+Return ONLY raw JSON: {{"body":"...","cta":"binary","send_as":"{'merchant_on_behalf' if customer else 'vera'}","rationale":"data points + WHY_NOW + LOSS_HOOK used"}}"""
 
     try:
         response = await call_groq_with_retry(
@@ -823,7 +865,7 @@ Return ONLY raw JSON (no markdown): {{"body":"...","cta":"binary","send_as":"{'m
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.3,
+            temperature=0.15,
             max_tokens=500,
             timeout=8.0,
         )
