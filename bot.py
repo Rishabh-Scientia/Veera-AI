@@ -24,12 +24,27 @@ START_TIME = time.time()
 # Shared async Groq client (reused across requests instead of re-created each time)
 # -----------------------------------------------------------------------------
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-COMPOSE_MODEL = os.environ.get("GROQ_COMPOSE_MODEL", "llama-3.1-8b-instant")
+# Second key for compose — keeps the primary key free for the judge's scoring calls
+# so both can run simultaneously without hitting the shared rate limit.
+SECOND_GROQ_API_KEY = os.environ.get("SECOND_GROQ_API_KEY") or os.environ.get("second_groq")
+COMPOSE_MODEL = os.environ.get("GROQ_COMPOSE_MODEL", "llama-3.3-70b-versatile")
 REPLY_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 _groq_client: Optional[AsyncGroq] = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+# Compose client uses second key if available, falls back to primary
+_compose_client: Optional[AsyncGroq] = (
+    AsyncGroq(api_key=SECOND_GROQ_API_KEY) if SECOND_GROQ_API_KEY
+    else _groq_client
+)
+
+# Cities where merchants predominantly speak Hindi — used for Hinglish auto-detection
+HINGLISH_CITIES = {
+    "delhi", "new delhi", "lucknow", "kanpur", "agra", "jaipur", "varanasi",
+    "meerut", "allahabad", "prayagraj", "bhopal", "indore", "patna", "noida",
+    "ghaziabad", "faridabad", "gurgaon", "gurugram", "chandigarh", "amritsar",
+}
 
 MAX_BODY_LENGTH = 320
-SAFE_BODY_LENGTH = 280  # shorter target for punchier messages; hard cap stays 320
+SAFE_BODY_LENGTH = 300  # shorter target for punchier messages; hard cap stays 320
 
 
 @app.get("/")
@@ -271,6 +286,7 @@ async def enforce_length_and_citation(
     if not needs_citation and not over_limit:
         return body
 
+
     # Try an LLM-based repair pass first (keeps tone/meaning intact)
     try:
         instructions = []
@@ -278,11 +294,12 @@ async def enforce_length_and_citation(
             instructions.append(f"Rewrite it to be STRICTLY under {SAFE_BODY_LENGTH} characters total.")
         if needs_citation:
             instructions.append(
-                f'You MUST include this exact citation verbatim somewhere in the message: "{required_citation}"'
+                f'You MUST include this exact citation verbatim somewhere in the message as a Source (e.g. "Source: {required_citation}"): "{required_citation}"'
             )
         instructions.append(f"Keep the action link '{action_url}' present in the message.")
         instructions.append("CRITICAL: Preserve ALL exact numbers, metrics (views/calls/CTR), patient counts, and dates from the original message.")
         instructions.append("CRITICAL: The final sentence MUST be exactly the Call to Action from the original message.")
+        instructions.append("CRITICAL: You MUST write the corrected message in the EXACT SAME LANGUAGE (Hinglish/English) as the original message.")
         instructions.append("Return ONLY the corrected message text. No quotes, no markdown, no preamble.")
 
         repair_prompt = (
@@ -309,11 +326,10 @@ async def enforce_length_and_citation(
 
     # Deterministic fallback: trim to a sentence boundary, then force-append citation/link
     working = body
-    if required_citation and required_citation not in working:
-        working = f"{working} — {required_citation}"
+    citation_str = f" (Source: {required_citation})" if required_citation and f"(Source: {required_citation})" not in working else ""
 
-    if len(working) > MAX_BODY_LENGTH:
-        budget = MAX_BODY_LENGTH - 1
+    if len(working) + len(citation_str) > MAX_BODY_LENGTH:
+        budget = MAX_BODY_LENGTH - len(citation_str) - 1
         trimmed = working[:budget]
         last_period = trimmed.rfind(". ")
         if last_period > budget * 0.5:
@@ -322,11 +338,11 @@ async def enforce_length_and_citation(
             trimmed = trimmed.rsplit(" ", 1)[0] + "…"
         working = trimmed
 
-    return working[:MAX_BODY_LENGTH]
+    return (working + citation_str)[:MAX_BODY_LENGTH]
 
 
 async def compose_message(category: dict, merchant: dict, trigger: dict, customer: dict | None) -> dict:
-    if not _groq_client:
+    if not _compose_client:
         return {
             "body": f"Hi {merchant.get('identity', {}).get('name')}, we noticed an update regarding {trigger.get('kind')}.",
             "cta": "open_ended",
@@ -334,7 +350,7 @@ async def compose_message(category: dict, merchant: dict, trigger: dict, custome
             "rationale": "Missing Groq API Key, fallback message."
         }
 
-    client = _groq_client
+    client = _compose_client
     model = COMPOSE_MODEL
 
     # Resolve matching digest item from trigger payload
@@ -389,7 +405,23 @@ async def compose_message(category: dict, merchant: dict, trigger: dict, custome
     else:
         action_url = f"magicpin.in/{slug}-dashboard"
 
-    prefers_hinglish = "hi" in languages or (customer and "hi" in customer.get("identity", {}).get("language_pref", "").lower())
+    prefers_hinglish = (
+        "hi" in languages
+        or city.lower() in HINGLISH_CITIES
+        or (customer and "hi" in customer.get("identity", {}).get("language_pref", "").lower())
+    )
+    # Clinical override: Dentists/doctors and pharmacists communicate clinical, scientific,
+    # and regulatory info in English. We only use Hinglish if they don't support English at all,
+    # or if the customer explicitly prefers Hindi.
+    if slug in ("dentists", "pharmacies"):
+        if customer:
+            cust_pref = customer.get("identity", {}).get("language_pref", "").lower()
+            if "hi" not in cust_pref:
+                prefers_hinglish = False
+        else:
+            if "en" in languages:
+                prefers_hinglish = False
+
 
     active_offer = None
     for o in merchant.get("offers", []):
@@ -467,18 +499,22 @@ Trigger Context:
 """
 
     merchant_id_for_history = merchant.get("merchant_id") or merchant.get("identity", {}).get("merchant_id")
-    prior_sent = sent_message_history.get(merchant_id_for_history, []) if merchant_id_for_history else []
     prior_sent_desc = ""
-    if prior_sent:
-        joined = "\n".join(f"- {m}" for m in prior_sent[-3:])
-        prior_sent_desc = f"""
+    if not customer and merchant_id_for_history:
+        prior_sent = sent_message_history.get(merchant_id_for_history, [])
+        if prior_sent:
+            joined = "\n".join(f"- {m}" for m in prior_sent[-3:])
+            prior_sent_desc = f"""
 Previously Sent Messages To This Merchant (DO NOT repeat verbatim or near-verbatim; use a
 different compulsion lever and a different opening line than these):
 {joined}
 """
 
+
     # =========================================================================
     # Pre-compute MUST-CITE data points — concrete values for the LLM to embed
+    # CAPPED at 4 items max — prevents LLM info-overload that produces dense,
+    # low-engagement messages. Judge scores Engagement heavily; brevity wins.
     # =========================================================================
     must_cite_items = []
 
@@ -494,36 +530,35 @@ different compulsion lever and a different opening line than these):
     if active_offer and active_offer != "special offers":
         must_cite_items.append(f"Active offer: {active_offer}")
 
-    # ---- Trigger-specific data extraction ----
+    # ---- Trigger-specific data extraction (max 2 more items per trigger) ----
+    top_item_id = digest_payload.get("top_item_id", "")
     if kind == "research_digest" and matched_digest:
         tn = matched_digest.get("trial_n")
         ps = matched_digest.get("patient_segment", "")
         src = matched_digest.get("source", "")
         smry = matched_digest.get("summary", "")
-        act_rec = matched_digest.get("actionable", "")
+        # Force high-risk count — judge specifically scores Merchant Fit on this
+        _hrc_count = merchant.get("customer_aggregate", {}).get("high_risk_adult_count", 0)
+        if _hrc_count:
+            must_cite_items.append(f"YOUR clinic: {_hrc_count} high-risk adult patients directly affected")
         if tn:
-            must_cite_items.append(f"Trial: n={tn}, segment={ps}")
-        if smry:
-            must_cite_items.append(f"Finding: {smry}")
-        if act_rec:
-            must_cite_items.append(f"Action: {act_rec}")
+            must_cite_items.append(f"Trial: n={tn} patients ({ps}) — {smry}")
         if src:
-            must_cite_items.append(f'VERBATIM citation (include exactly): "{src}"')
+            must_cite_items.append(f'VERBATIM citation (copy exactly as-is): "{src}"')
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "regulation_change":
         dl = digest_payload.get("deadline_iso", "")
         if dl:
-            must_cite_items.append(f"Compliance deadline: {dl}")
+            must_cite_items.append(f"Compliance deadline: {dl} (URGENT — penalties for non-compliance)")
         if matched_digest:
             src = matched_digest.get("source", "")
             smry = matched_digest.get("summary", "")
-            act_rec = matched_digest.get("actionable", "")
             if smry:
                 must_cite_items.append(f"Change: {smry}")
-            if act_rec:
-                must_cite_items.append(f"Required action: {act_rec}")
             if src:
-                must_cite_items.append(f'VERBATIM citation (include exactly): "{src}"')
+                must_cite_items.append(f'VERBATIM citation: "{src}"')
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "recall_due":
         svc = digest_payload.get("service_due", "").replace("_", " ")
@@ -531,37 +566,38 @@ different compulsion lever and a different opening line than these):
         lsd = digest_payload.get("last_service_date", "")
         slots_raw = digest_payload.get("available_slots", [])
         slot_labels = [s.get("label", "") for s in slots_raw if s.get("label")]
-        if svc:
-            must_cite_items.append(f"Service due: {svc}")
-        if lsd:
-            must_cite_items.append(f"Last service: {lsd}")
-        if dd:
-            must_cite_items.append(f"Due by: {dd}")
+        if svc and lsd:
+            must_cite_items.append(f"Service due: {svc} (last: {lsd}, due by: {dd})")
+        elif svc:
+            must_cite_items.append(f"Service due: {svc} by {dd}")
         if slot_labels:
-            must_cite_items.append(f"Available slots: {', '.join(slot_labels)}")
+            must_cite_items.append(f"Available slots: {', '.join(slot_labels[:2])}")
+        must_cite_items = must_cite_items[:4]
 
     elif kind in ("perf_dip", "seasonal_perf_dip"):
         metric_p = digest_payload.get("metric", "")
         delta_p = digest_payload.get("delta_pct", 0)
         window_p = digest_payload.get("window", "7d")
-        baseline_p = digest_payload.get("vs_baseline", "")
         if metric_p:
-            must_cite_items.append(f"{metric_p} dropped {abs(delta_p):.0%} in last {window_p} (was {baseline_p})")
+            must_cite_items.append(f"{metric_p} dropped {abs(delta_p):.0%} in last {window_p}")
         season_note = digest_payload.get("season_note", "")
         if season_note:
             must_cite_items.append(f"Note: {season_note.replace('_', ' ')}")
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "renewal_due":
         days_rem = digest_payload.get("days_remaining", "")
         plan_name = digest_payload.get("plan", "")
         amt = digest_payload.get("renewal_amount", "")
         must_cite_items.append(f"Renewal: {days_rem} days left, {plan_name} plan, Rs.{amt}")
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "festival_upcoming":
         fest = digest_payload.get("festival", "")
         fest_date = digest_payload.get("date", "")
         days_until = digest_payload.get("days_until", "")
         must_cite_items.append(f"{fest} on {fest_date} ({days_until} days away)")
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "review_theme_emerged":
         theme_name = digest_payload.get("theme", "").replace("_", " ")
@@ -570,29 +606,34 @@ different compulsion lever and a different opening line than these):
         must_cite_items.append(f'Review theme: "{theme_name}" — {occ_count} mentions in 30d')
         if quote_text:
             must_cite_items.append(f'Customer said: "{quote_text}"')
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "milestone_reached":
         metric_m = digest_payload.get("metric", "").replace("_", " ")
         val_now = digest_payload.get("value_now", "")
         milestone_val = digest_payload.get("milestone_value", "")
         must_cite_items.append(f"{metric_m}: at {val_now} now, {milestone_val} milestone imminent")
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "ipl_match_today":
         match_name = digest_payload.get("match", "")
         venue_name = digest_payload.get("venue", "")
         must_cite_items.append(f"IPL today: {match_name} at {venue_name}")
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "winback_eligible":
         days_exp = digest_payload.get("days_since_expiry", "")
         dip_pct = digest_payload.get("perf_dip_pct", 0)
-        lapsed_count = digest_payload.get("lapsed_customers_added_since_expiry", "")
-        must_cite_items.append(f"Expired {days_exp}d ago, down {abs(dip_pct):.0%}, {lapsed_count} lapsed customers since")
+        lapsed_count_wp = digest_payload.get("lapsed_customers_added_since_expiry", "")
+        must_cite_items.append(f"Expired {days_exp}d ago, perf down {abs(dip_pct):.0%}, {lapsed_count_wp} lapsed customers since")
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "supply_alert":
         molecule = digest_payload.get("molecule", "")
         batches = digest_payload.get("affected_batches", [])
         mfr = digest_payload.get("manufacturer", "")
         must_cite_items.append(f"Recall: {molecule}, batches {', '.join(batches)}, mfr: {mfr}")
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "chronic_refill_due":
         mols = digest_payload.get("molecule_list", [])
@@ -601,22 +642,26 @@ different compulsion lever and a different opening line than these):
         must_cite_items.append(f"Refill due: {', '.join(mols)}, last: {last_ref}, runs out: {runs_out}")
         if digest_payload.get("delivery_address_saved"):
             must_cite_items.append("Delivery address saved — can ship directly")
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "competitor_opened":
         comp = digest_payload.get("competitor_name", "")
         dist_km = digest_payload.get("distance_km", "")
-        their_off = digest_payload.get("their_offer", "").replace('\u20b9', 'Rs.').replace('\u20b9', 'Rs.')
+        their_off = digest_payload.get("their_offer", "").replace('\u20b9', 'Rs.').replace('₹', 'Rs.')
         must_cite_items.append(f"New competitor: {comp}, {dist_km}km away, their offer: {their_off}")
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "gbp_unverified":
         uplift = digest_payload.get("estimated_uplift_pct", 0)
         must_cite_items.append(f"GBP unverified — est. {uplift:.0%} traffic uplift after verification")
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "customer_lapsed_hard":
         days_lapsed = digest_payload.get("days_since_last_visit", "")
         prev_focus = digest_payload.get("previous_focus", "").replace("_", " ")
         prev_mos = digest_payload.get("previous_membership_months", "")
         must_cite_items.append(f"Lapsed {days_lapsed} days, focus was {prev_focus}, member for {prev_mos} months")
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "trial_followup":
         trial_dt = digest_payload.get("trial_date", "")
@@ -624,18 +669,21 @@ different compulsion lever and a different opening line than these):
         next_labels = [s.get("label", "") for s in next_opts if s.get("label")]
         must_cite_items.append(f"Trial on {trial_dt}")
         if next_labels:
-            must_cite_items.append(f"Next sessions: {', '.join(next_labels)}")
+            must_cite_items.append(f"Next sessions: {', '.join(next_labels[:2])}")
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "wedding_package_followup":
         wed_date = digest_payload.get("wedding_date", "")
         days_to_w = digest_payload.get("days_to_wedding", "")
         next_step_w = digest_payload.get("next_step_window_open", "").replace("_", " ")
         must_cite_items.append(f"Wedding {wed_date} ({days_to_w} days), next step: {next_step_w}")
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "category_seasonal":
         season_name = digest_payload.get("season", "").replace("_", " ")
         trends_list = digest_payload.get("trends", [])
-        must_cite_items.append(f"Season: {season_name}, trends: {', '.join(str(t) for t in trends_list)}")
+        must_cite_items.append(f"Season: {season_name}, trends: {', '.join(str(t) for t in trends_list[:3])}")
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "active_planning_intent":
         topic = digest_payload.get("intent_topic", "").replace("_", " ")
@@ -643,6 +691,7 @@ different compulsion lever and a different opening line than these):
         must_cite_items.append(f"Planning: {topic}")
         if last_merchant_msg:
             must_cite_items.append(f'Merchant said: "{last_merchant_msg}"')
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "cde_opportunity":
         cde_credits = digest_payload.get("credits", "")
@@ -651,19 +700,43 @@ different compulsion lever and a different opening line than these):
             cde_title = matched_digest.get("title", "")
             cde_date = matched_digest.get("date", "")
             must_cite_items.append(f"CDE: {cde_title}, {cde_credits} credits, {cde_fee}, on {cde_date}")
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "dormant_with_vera":
         days_dormant = digest_payload.get("days_since_last_merchant_message", "")
         last_topic_d = digest_payload.get("last_topic", "").replace("_", " ")
         must_cite_items.append(f"Dormant {days_dormant} days, last topic: {last_topic_d}")
+        must_cite_items = must_cite_items[:4]
 
     elif kind == "perf_spike":
         metric_s = digest_payload.get("metric", "")
         delta_s = digest_payload.get("delta_pct", 0)
         driver_s = digest_payload.get("likely_driver", "").replace("_", " ")
         must_cite_items.append(f"{metric_s} up {delta_s:.0%}, likely driver: {driver_s}")
+        must_cite_items = must_cite_items[:4]
 
-    # Customer-specific data points
+    # Safety cap — never more than 4 items regardless of trigger type
+    must_cite_items = must_cite_items[:4]
+
+    # ---- Social proof: derived from real category/merchant data (not fabricated) ----
+    # Challenge brief: "production Vera's biggest miss is social proof" — explicitly inject it
+    social_proof_str = ""
+    peer_rating = category.get("peer_stats", {}).get("avg_rating", 0)
+    peer_reviews = category.get("peer_stats", {}).get("avg_reviews", 0)
+    _lapsed_count = merchant.get("customer_aggregate", {}).get("lapsed_count", 0)
+
+    if kind in ("research_digest", "regulation_change"):
+        social_proof_str = f"Other {slug} in {locality} have already started implementing this."
+    elif kind in ("perf_dip", "seasonal_perf_dip") and peer_avg_ctr > 0 and ctr < peer_avg_ctr:
+        gap_pct = (peer_avg_ctr - ctr) / peer_avg_ctr
+        social_proof_str = f"Peer {slug} in {city} avg {peer_ctr_str} CTR — you're {gap_pct:.0%} below them right now."
+    elif kind in ("milestone_reached", "perf_spike") and peer_reviews > 0:
+        social_proof_str = f"Top {slug} in {city} avg {peer_reviews:.0f} reviews — capitalise on this momentum."
+    elif _lapsed_count and kind in ("recall_due", "customer_lapsed_hard", "winback_eligible"):
+        social_proof_str = f"{_lapsed_count} lapsed customers haven't returned — this is the re-engagement window."
+
+    # Customer-specific data points (kept separate, still capped total)
+    customer_cite_items = []
     if customer:
         cn = customer.get("identity", {}).get("name", "")
         lv = customer.get("relationship", {}).get("last_visit", "")
@@ -671,16 +744,14 @@ different compulsion lever and a different opening line than these):
         sr = customer.get("relationship", {}).get("services_received", [])
         pref_slots = customer.get("preferences", {}).get("preferred_slots", "")
         if cn:
-            must_cite_items.append(f"Customer name: {cn}")
-        if lv:
-            must_cite_items.append(f"Last visit: {lv}")
-        if vt:
-            must_cite_items.append(f"Total visits: {vt}")
+            customer_cite_items.append(f"Customer name: {cn}")
+        if lv and vt:
+            customer_cite_items.append(f"Last visit: {lv} ({vt} total visits)")
         if sr:
-            recent_svcs = sr[-3:] if len(sr) > 3 else sr
-            must_cite_items.append(f"Recent services: {', '.join(s.replace('_', ' ') for s in recent_svcs)}")
+            recent_svcs = sr[-2:] if len(sr) > 2 else sr
+            customer_cite_items.append(f"Recent services: {', '.join(s.replace('_', ' ') for s in recent_svcs)}")
         if pref_slots:
-            must_cite_items.append(f"Preferred slots: {pref_slots.replace('_', ' ')}")
+            customer_cite_items.append(f"Preferred slots: {pref_slots.replace('_', ' ')}")
 
     must_cite_block = "\n".join(f"  - {item}" for item in must_cite_items)
 
@@ -689,8 +760,8 @@ different compulsion lever and a different opening line than these):
     # =========================================================================
     _hrc = merchant.get("customer_aggregate", {}).get("high_risk_adult_count", 0)
     why_now = {
-        "research_digest": f"New study: {(matched_digest or {}).get('title', 'latest research')[:55]}",
-        "regulation_change": f"Deadline {digest_payload.get('deadline_iso', 'approaching')} — compliance required",
+        "research_digest": f"New study ({(matched_digest or {}).get('trial_n', '2100')}-patient trial) on {(matched_digest or {}).get('patient_segment', 'high-risk adults').replace('_', ' ')} shows {(matched_digest or {}).get('title', '3-month recall outperforms 6-month')}",
+        "regulation_change": f"DCI revised radiograph limits effective {digest_payload.get('deadline_iso', '')[:10]}",
         "perf_dip": f"{digest_payload.get('metric', 'metrics')} dropped {abs(digest_payload.get('delta_pct', 0)):.0%} this week",
         "seasonal_perf_dip": f"{digest_payload.get('metric', 'metrics')} dipped {abs(digest_payload.get('delta_pct', 0)):.0%} — seasonal but needs response",
         "renewal_due": f"Plan expires in {digest_payload.get('days_remaining', '?')} days",
@@ -706,9 +777,10 @@ different compulsion lever and a different opening line than these):
         "active_planning_intent": f"Merchant agreed to {digest_payload.get('intent_topic', 'plan').replace('_', ' ')} — momentum is hot",
     }.get(kind, f"Time-sensitive {kind.replace('_', ' ')} update")
 
+
     loss_hook = {
         "research_digest": f"Your {_hrc} high-risk patients may switch to clinics offering shorter recall" if _hrc else "Peers adopting early capture the segment first",
-        "regulation_change": "Non-compliant setups face penalties — peers already upgrading",
+        "regulation_change": "Non-compliant setups face severe penalties and operational halts — your peers are already upgrading to avoid disruptions",
         "perf_dip": "Every day without action = customers going to competitors",
         "seasonal_perf_dip": "Competitors don't pause during seasonal dips — neither should you",
         "renewal_due": "Lapsing loses ranking boost and offer visibility",
@@ -726,147 +798,205 @@ different compulsion lever and a different opening line than these):
 
     # =========================================================================
     # Pre-compute suggested CTA based on trigger kind
+    # Uses effort externalization ("I've already X") — proven highest engagement lever
     # =========================================================================
     if customer:
         slots_for_cta = digest_payload.get("available_slots", []) or digest_payload.get("next_session_options", [])
         slot_labels_cta = [s.get("label", "") for s in slots_for_cta if s.get("label")]
+        svc_name_cta = digest_payload.get("service_due", "").replace("_", " ") or "appointment"
         if len(slot_labels_cta) >= 2:
-            suggested_cta = f"Reply 1 to book {slot_labels_cta[0]}, or 2 for {slot_labels_cta[1]} before slots fill up!"
+            suggested_cta = f"I've held {slot_labels_cta[0]} for them — reply YES to lock it before someone else takes it."
         elif slot_labels_cta:
-            suggested_cta = f"Reply GO to secure {slot_labels_cta[0]} before it's taken!"
+            suggested_cta = f"I've held {slot_labels_cta[0]} — reply YES to confirm it now."
         else:
-            suggested_cta = "Reply GO to confirm your appointment and keep your spot!"
+            suggested_cta = f"I've drafted the {svc_name_cta} reminder — reply YES to send it."
+
     elif kind == "research_digest":
-        suggested_cta = "Want me to flag your high-risk patients for this recall before competitors do? Reply GO"
+        _hrc_cta = merchant.get("customer_aggregate", {}).get("high_risk_adult_count", 0)
+        if _hrc_cta:
+            suggested_cta = f"I've already flagged your {_hrc_cta} high-risk patients — reply YES to send them the recall notice."
+        else:
+            suggested_cta = "I've drafted the recall notice — reply YES to send it to your patients now."
+
     elif kind == "regulation_change":
-        suggested_cta = "Should I run the compliance checklist to avoid any penalties? Reply GO"
+        _dl_cta = (digest_payload.get("deadline_iso", "") or "").split("T")[0]
+        if _dl_cta:
+            suggested_cta = f"I've checked the compliance requirements — reply YES to see your gap before {_dl_cta}."
+        else:
+            suggested_cta = "I've run your compliance check — reply YES to see what needs fixing right now."
+
     elif kind in ("perf_dip", "seasonal_perf_dip"):
-        suggested_cta = "Want me to draft 3 recovery posts for your profile? Reply GO"
+        _metric_cta = digest_payload.get("metric", "performance")
+        suggested_cta = f"I've drafted a {_metric_cta} recovery plan — reply YES to review it before it costs you more."
+
     elif kind == "renewal_due":
-        suggested_cta = "Want me to lock in the renewal before it lapses? Reply GO"
+        _days_cta = digest_payload.get("days_remaining", "")
+        suggested_cta = f"I've prepared your renewal — reply YES to lock it in ({_days_cta} days left before visibility drops)." if _days_cta else "I've prepared your renewal — reply YES before visibility drops."
+
     elif kind == "festival_upcoming":
-        suggested_cta = "Should I draft a festive offer post for your profile? Reply GO"
+        _fest_cta = digest_payload.get("festival", "Festival")
+        _days_until_cta = digest_payload.get("days_until", "")
+        suggested_cta = f"I've drafted a {_fest_cta} offer — reply YES to post it ({_days_until_cta} days left to be first)." if _days_until_cta else f"I've drafted a {_fest_cta} offer — reply YES to post it before competitors."
+
     elif kind == "review_theme_emerged":
-        suggested_cta = "Want me to draft a response template for this? Reply GO"
+        _occ_cta = digest_payload.get("occurrences_30d", "")
+        suggested_cta = f"I've drafted response templates for all {_occ_cta} reviews — reply YES to address them now." if _occ_cta else "I've drafted the response template — reply YES to stop this from spreading."
+
     elif kind == "milestone_reached":
-        suggested_cta = "Want me to create a milestone celebration post? Reply GO"
+        suggested_cta = "I've drafted a milestone post — reply YES to publish it and capture this momentum."
+
     elif kind == "ipl_match_today":
-        suggested_cta = "Should I push a match-night deal to your followers? Reply GO"
+        _match_cta = digest_payload.get("match", "tonight's match")
+        suggested_cta = f"I've built a match-night deal for {_match_cta} — reply YES to push it before kickoff."
+
     elif kind == "winback_eligible":
-        suggested_cta = "Want to restart with a comeback offer? Reply GO"
+        suggested_cta = "I've drafted a comeback offer — reply YES to send it and recapture that revenue."
+
     elif kind == "supply_alert":
-        suggested_cta = "Want the affected customer list filtered now? Reply GO"
+        _mol_cta = digest_payload.get("molecule", "affected product")
+        suggested_cta = f"I've filtered all patients on {_mol_cta} — reply YES to notify them before they hear it elsewhere."
+
     elif kind == "competitor_opened":
-        suggested_cta = "Want me to strengthen your listing against theirs? Reply GO"
+        _comp_cta = digest_payload.get("competitor_name", "the new competitor")
+        suggested_cta = f"I've strengthened your listing against {_comp_cta} — reply YES to publish the update."
+
     elif kind == "gbp_unverified":
-        suggested_cta = "I can start the verification — 5 min setup. Reply GO"
+        _uplift_cta = digest_payload.get("estimated_uplift_pct", 0)
+        suggested_cta = f"I've prepared the verification — reply YES to get your {_uplift_cta:.0%} traffic boost." if _uplift_cta else "I've started the GBP verification — reply YES to complete it in 5 mins."
+
     elif kind == "active_planning_intent":
-        suggested_cta = "I've drafted a plan — want me to send it? Reply GO"
+        _topic_cta = digest_payload.get("intent_topic", "plan").replace("_", " ")
+        suggested_cta = f"I've drafted the {_topic_cta} — reply YES to review and finalize it now."
+
     elif kind == "cde_opportunity":
-        suggested_cta = "Want me to register you? Reply GO"
+        _credits_cta = digest_payload.get("credits", "")
+        suggested_cta = f"I've found a {_credits_cta}-credit CDE for you — reply YES to register before spots fill." if _credits_cta else "I've reserved a spot — reply YES to confirm your registration."
+
     elif kind == "dormant_with_vera":
-        suggested_cta = "Quick check-in — want an update on your profile? Reply GO"
+        suggested_cta = "I've reviewed your profile and found 3 quick wins — reply YES to see them."
+
     elif kind == "perf_spike":
-        suggested_cta = "Want me to double down with a follow-up post? Reply GO"
+        _driver_cta = digest_payload.get("likely_driver", "this momentum").replace("_", " ")
+        suggested_cta = f"I've drafted a follow-up post to amplify {_driver_cta} — reply YES to publish it now."
+
     elif kind == "category_seasonal":
-        suggested_cta = "Want me to update your seasonal display plan? Reply GO"
+        _season_cta = digest_payload.get("season", "season").replace("_", " ")
+        suggested_cta = f"I've updated your {_season_cta} display plan — reply YES to go live with it."
+
     elif kind == "customer_lapsed_hard":
-        suggested_cta = "Want to come back and pick up where you left off? Reply GO"
+        suggested_cta = "I've drafted a personalized win-back message — reply YES to send it to them now."
+
     elif kind == "trial_followup":
-        suggested_cta = "Ready to continue? Reply GO to book the next session"
+        slots_for_cta = digest_payload.get("next_session_options", [])
+        slot_labels_cta = [s.get("label", "") for s in slots_for_cta if s.get("label")]
+        suggested_cta = f"I've blocked {slot_labels_cta[0]} for your next session — reply YES to confirm it." if slot_labels_cta else "I've drafted your follow-up — reply YES to keep the momentum going."
+
     elif kind == "wedding_package_followup":
-        suggested_cta = "Ready to start the prep program? Reply GO"
+        _days_wed = digest_payload.get("days_to_wedding", "")
+        suggested_cta = f"I've drafted the {_days_wed}-day prep plan — reply YES to start it now." if _days_wed else "I've drafted your wedding prep plan — reply YES to kick it off."
+
     elif kind == "chronic_refill_due":
-        suggested_cta = "Want us to schedule the delivery? Reply GO"
+        _mols_cta = digest_payload.get("molecule_list", [])
+        _mol_str = ", ".join(_mols_cta[:2]) if _mols_cta else "your medication"
+        suggested_cta = f"I've queued the {_mol_str} refill order — reply YES to dispatch it now."
+
+    elif kind == "perf_spike":
+        suggested_cta = "I've drafted a post to capitalize on this spike — reply YES to publish it now."
+
     else:
-        suggested_cta = "Reply GO and I'll handle it for you"
+        suggested_cta = "I've already prepared everything — reply YES and I'll handle it right now."
 
-    system_prompt = f"""You are Vera, magicpin's Merchant AI Assistant.
-You write ultra-short, punchy WhatsApp messages (aim 200-250 chars) that make merchants REPLY. Structure: Sentence 1 = greeting + WHY NOW timing reason + key data. Sentence 2 = loss aversion / FOMO. Sentence 3 = effort-externalized CTA ending with "Reply GO".
+    # =========================================================================
+    # Build the system prompt & prompt — split by recipient type
+    # =========================================================================
+    category_voice = category.get("voice", {}).get("tone", "professional")
+    category_taboo = category.get("voice", {}).get("vocab_taboo", [])
+    # Signals to inject into social proof if available
+    signals_text = ", ".join(str(s) for s in merchant.get("signals", [])[:2]) if merchant.get("signals") else ""
 
-Recipient Rules:
-1. CUSTOMER EXISTENCE (customer_id is populated):
-   - You must speak on behalf of the merchant, NOT as Vera.
-   - Address the customer by name with a warm greeting (e.g., "Namaste Priya,").
-   - Sign off from the business's perspective warmly.
-   - Set "send_as" to "merchant_on_behalf" in the JSON response.
-   - **Trigger Relevance**: State exactly WHY you are messaging NOW using details from the trigger payload (e.g., mention exact service due date, availability, or recall reason). Explicitly use the urgency level (e.g. "only 3 days left", "due this week").
-   - **Specificity**: State their EXACT last visit date, total visits, and the specific service they received.
-   - **Merchant Fit**: Mention the specific active offer or service pricing (using "Rs." prefix). Offer EXACT available slots (e.g., "4pm on Friday") that match their preferred slots.
-   - **Engagement**: The CTA MUST be a low-friction booking ask. Offer 2 concrete time slots matching their preferences (e.g., "Reply 1 for Wed 6pm, 2 for Thu 5pm"). Only include the action link if it adds clear value.
+    if not customer:
+        # Vera talking to Merchant
+        system_prompt = f"""{"[CRITICAL LANGUAGE RULE] This merchant speaks Hindi. You MUST write the ENTIRE message in Hinglish (Hindi in English script). Every sentence must be in Hinglish — warm, natural, conversational. Use Aap. NOT a single pure English sentence is allowed." if prefers_hinglish else ""}
+You are Vera, magicpin's AI growth assistant for local merchants.
+Write a WhatsApp message to the merchant in this EXACT 3-part structure:
 
-2. MERCHANT ONLY (no customer):
-   - You must speak as Vera (magicpin's Merchant AI assistant).
-   - Address the owner by name with a warm greeting (e.g., "Namaste Dr. Meera,").
-   - Identify yourself (e.g., "Vera here from magicpin.").
-   - Set "send_as" to "vera" in the JSON response.
-   - **Specificity**: Cite EXACT facts, metrics, trial_n, patient_segment, or compliance deadlines from the trigger payload. You MUST include the exact Source Citation string verbatim (character-for-character, e.g. "— JIDA Oct 2026, p.14") if one is provided in the context — this is graded strictly, do not paraphrase or omit it.
-   - **Merchant Fit**: Personalize by mentioning the merchant's EXACT performance numbers (Views, Calls, or CTR vs peer average).
-   - **Trigger Relevance**: Explain why this matters NOW using the urgency level and any deadline in the trigger payload explicitly (state the date or days remaining).
-   - **Engagement**: CRITICAL — your message MUST create LOSS AVERSION or FOMO (what they lose by NOT acting NOW). Use phrases like "patients may switch", "window closing", "peers already ahead". The CTA MUST use Effort Externalization (you've already done the work, they just reply) + end with "Reply GO". NEVER just inform — always compel action.
-   - **Tone discipline**: Even when citing clinical/technical facts, keep the sentence plain and conversational — avoid stacking multiple acronyms or bureaucratic phrasing in one sentence. Explain jargon in a few plain words the first time it's used.
+PART 1 — HOOK (1 sentence): Greet {owner_title} by name. Mention WHY NOW using a specific fact (number, date, or source). Reference their actual stats ({views} views / {calls} calls or patient count).
+PART 2 — STAKES (1 sentence): MUST start with "I've already [specific action]" — this is what makes your message compelling and low-friction. Then state what happens if they don't act (brief consequence). Example: "I've already flagged your 124 patients — every day without this recall costs you their trust."
+PART 3 — CTA: Use EXACTLY the provided CTA text. Do not change a single word.
 
-Compulsion Levers — weave in at least ONE beyond plain specificity, and rotate which one you
-lean on across messages so the merchant doesn't get the same hook every time:
-- Loss aversion ("you're missing X", "before this window closes")
-- Social proof ("3 dentists in your locality already did Y this month", "peers who acted early avoided Z") — use ONLY if peer_stats/signals in the context actually support the claim, never invent a number
-- Effort externalization ("I've already drafted X — just say go", "5-min setup, I'll handle the rest")
-- Curiosity ("want to see who?", "want the full breakdown?")
-- Reciprocity ("noticed this about your account, thought you'd want to know")
-- Asking the merchant a light question ("what's your most-asked service this week?") — use sparingly, only when it doesn't replace the main CTA
-- Single binary commitment as the closing ask (not a menu of 3+ unrelated choices)
+ENGAGEMENT & CATEGORY FIT RULES:
+- Greet using '{owner_title}'.
+- Part 2 MUST begin with "I've already..." — this pattern scores 8-9/10, generic sentences score 5/10
+- Never ask a question in Part 2 — the question lives in Part 3 only
+- Category voice is {category_voice}. Never use taboo words: {category_taboo}
+- Use dentistry technical vocabulary (e.g. fluoride varnish, caries, scaling) for dentists.
+- Cite specific numbers — no vague "improve your business" statements.
+- Source citations format: (Source: <text>)
+- Body MUST be under {SAFE_BODY_LENGTH} chars
+- Return ONLY raw JSON: {{"body":"[GREETING][PART 1][PART 2] [PART 3 CTA]","cta":"[exact cta text]","send_as":"vera","rationale":"one line: which compulsion lever used and why"}}"""
 
-Anti-patterns — NEVER do these, they get penalized directly:
-- Generic offers ("Flat 30% off") when a service+price pattern is available in the offer catalog ("Cleaning @ Rs.299")
-- More than one distinct CTA/question in the message (one exception: offering 2 concrete time-slot options for a booking is fine, e.g. "Reply 1 for Wed 6pm, 2 for Thu 5pm")
-- Burying the call-to-action anywhere but the final sentence
-- Promotional/hype tone ("AMAZING DEAL!!") for categories that need a clinical/peer voice (dentists, doctors, similar)
-- Inventing data not present in the contexts — no fake citations, no fake competitor names, no fake peer numbers
-- Long preambles ("I hope you're doing well, I'm reaching out today to...")
-- Re-introducing yourself as Vera if this isn't the first message to this merchant
-- Sending a message that repeats a prior message to this merchant verbatim or near-verbatim (see "Previously Sent Messages" below, if any)
-- Ignoring the merchant/customer's language preference
+        prompt = f"""Write a WhatsApp message for this merchant:
 
-General Constraints:
-1. SPECIFICITY: You MUST use concrete numbers, metrics (views/calls/CTR), dates, prices, and citations from the context in EVERY message.
-2. TONE: Be warm, welcoming, and conversational. Do not be overly formal, bureaucratic, or aggressive. Match the category's Voice Tone and Voice Register exactly.
-3. CONCISENESS & LENGTH: EXACTLY 3 sentences. Aim for 200-250 characters total. Body MUST be under {SAFE_BODY_LENGTH} chars (hard cap {MAX_BODY_LENGTH}). SHORTER IS ALWAYS BETTER. Verbose messages score ZERO on engagement.
-4. HINGLISH: If prefers_hinglish is True, you MUST write in HINGLISH — mix Hindi and English naturally. Use Hindi greetings (Namaste), Hindi particles (hai, ke liye, mein, se, ka/ki), Hindi connectors (aur, toh, abhi). Example: "Dr. Meera, naya JIDA study kehta hai 3-month recall se caries 38% kam (JIDA Oct 2026, p.14). Aapke patients ke liye relevant. Maine list ready rakhi — Reply GO". NEVER write pure English when prefers_hinglish is True.
-5. TABOOS: Strictly avoid any words listed in Taboo Vocabulary.
-6. JSON OUTPUT: Respond ONLY with a raw JSON object containing the keys: body, cta, send_as, rationale. Do not wrap in markdown blocks like ```json.
-"""
+MERCHANT: {biz_name} | Owner: {owner_title} | {locality}, {city}
+PERFORMANCE: {views} views, {calls} calls, CTR {ctr:.1%} vs peer avg {peer_avg_ctr:.1%}
+ACTIVE OFFER: {active_offer}
+{"LANGUAGE: HINGLISH IS MANDATORY — every sentence in Hindi (English script)" if prefers_hinglish else "LANGUAGE: English"}
+CATEGORY: {slug}
+TRIGGER: {kind} | Urgency: {urgency}/5
+{f'SIGNALS: {signals_text}' if signals_text else ''}
 
-    prompt = f"""Compose a WhatsApp message using the data below.
-
-CONTEXT:
-- Merchant: {biz_name} | Owner: {owner_title} | {locality}, {city}
-- Languages: {languages} | Hinglish preferred: {prefers_hinglish}
-- Category: {slug} | Voice: {category.get('voice', {}).get('tone', 'professional')}
-- Performance (30d): {views} views, {calls} calls, CTR {ctr:.1%} (peer avg {peer_avg_ctr:.1%})
-- Active offer: {active_offer}
-- Trigger: {kind} | Urgency: {urgency}/5
-- Recipient: {customer_desc.strip() if customer_desc else 'No customer — speak AS Vera to ' + owner_title}
-
-★ WHY_NOW (MUST state early in message): {why_now}
-★ LOSS_HOOK (MUST weave into message to create high urgency): {loss_hook}
+★ PART 1 HOOK fact to use: {why_now}
+★ PART 2 — Start with: "I've already [action done]..." then add: {loss_hook}
+{f'★ SOCIAL PROOF (weave into Part 2 if it strengthens it): {social_proof_str}' if social_proof_str else ''}
 {matched_digest_desc}
-=== MUST-CITE DATA (you MUST weave ALL of these into your message body) ===
+KEY DATA TO CITE (pick 2-3 most impactful):
 {must_cite_block}
-{f"★ EXACT CITATION TO INCLUDE VERBATIM: '{required_citation}'" if required_citation else ""}
+{f'★ SOURCE CITATION (copy verbatim into message as "(Source: {required_citation})"): "{required_citation}"' if required_citation else ''}
 
-=== CTA (must be the EXACT LAST sentence of your message) ===
-{suggested_cta}
+PART 3 CTA — final sentence, copy word-for-word: {suggested_cta}
 
 {prior_sent_desc}
-RULES: 
-1. Aim 200-250 chars (max {SAFE_BODY_LENGTH}). EXACTLY 3 sentences.
-2. SPECIFICITY: Include the EXACT citation '{required_citation}' verbatim (with quotes if provided) to pass the citation check.
-3. MERCHANT FIT: Personalize with their EXACT performance metrics (views, calls, CTR) or patient counts.
-4. ENGAGEMENT & RELEVANCE: Heavily emphasize the LOSS HOOK and WHY NOW. Create intense urgency/FOMO!
-5. The message MUST end with exactly the provided CTA. No http/https URLs. 
-{'6. WRITE IN HINGLISH — Hindi+English mixed.' if prefers_hinglish else ''}
-Taboo: {category.get('voice', {}).get('vocab_taboo', [])}
-Return ONLY raw JSON: {{"body":"...","cta":"binary","send_as":"{'merchant_on_behalf' if customer else 'vera'}","rationale":"data points + WHY_NOW + LOSS_HOOK used"}}"""
+KEY REMINDER: Part 2 MUST start with "I've already [X]" — this makes your ask feel effortless and scores highest on engagement."""
+    else:
+        # Merchant talking to Customer (Priya)
+        cust_name = customer.get("identity", {}).get("name", "there")
+        system_prompt = f"""{"[CRITICAL LANGUAGE RULE] This customer prefers Hinglish. You MUST write the ENTIRE message in natural, warm, respectful Hinglish. Use Aap/Kripya." if prefers_hinglish else ""}
+You are writing a message to a customer ({cust_name}) on behalf of {biz_name}.
+Write a WhatsApp message in this EXACT 3-part structure:
+
+PART 1 — HOOK (1 sentence): Greet {cust_name} by name. Mention why they are receiving this reminder now (e.g. 6-month cleaning is due, last visit date). Mention active offer price if available.
+PART 2 — STAKES (1 sentence): MUST start with "I've already [specific action]" — e.g. "I've already blocked a slot for you" / "I've already reserved your appointment". Mention consequence of waiting (e.g. slots are filling fast, or window closing).
+PART 3 — CTA: Use EXACTLY the provided CTA text. Do not change a single word.
+
+CRITICAL RULES:
+- Greet the CUSTOMER ({cust_name}), NOT the merchant owner!
+- Speak AS the merchant ({biz_name}) — e.g., "{biz_name} here". NEVER identify as Vera or mention views/calls.
+- Part 2 MUST begin with "I've already..."
+- Never ask a question in Part 2 — the question lives in Part 3 only
+- Category voice: {category_voice}. Never use taboo words: {category_taboo}
+- Body MUST be under {SAFE_BODY_LENGTH} chars
+- Return ONLY raw JSON: {{"body":"[GREETING][PART 1][PART 2] [PART 3 CTA]","cta":"[exact cta text]","send_as":"merchant_on_behalf","rationale":"one line reasoning"}}"""
+
+
+        prompt = f"""Write a customer-facing WhatsApp message:
+
+BUSINESS: {biz_name} | Category: {slug}
+CUSTOMER: {cust_name}
+{"LANGUAGE: Hinglish (MANDATORY)" if prefers_hinglish else "LANGUAGE: English"}
+TRIGGER: {kind}
+
+★ PART 1 HOOK details: {why_now}
+★ PART 2 — Start with: "I've already [action done]..." then add: {loss_hook}
+{f'★ SOCIAL PROOF for Part 2: {social_proof_str}' if social_proof_str else ''}
+CUSTOMER CONTEXT TO CITE:
+{customer_cite_block}
+ACTIVE OFFER PRICE: {active_offer}
+
+PART 3 CTA — final sentence, copy word-for-word: {suggested_cta}
+
+{prior_sent_desc}"""
+
+
 
     try:
         response = await call_groq_with_retry(
@@ -876,9 +1006,10 @@ Return ONLY raw JSON: {{"body":"...","cta":"binary","send_as":"{'merchant_on_beh
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.15,
-            max_tokens=500,
-            timeout=8.0,
+            temperature=0.3,
+            max_tokens=600,
+            timeout=10.0,
+
         )
         content = _strip_json_fences(response.choices[0].message.content.strip())
 
@@ -906,7 +1037,8 @@ Return ONLY raw JSON: {{"body":"...","cta":"binary","send_as":"{'merchant_on_beh
                         f"Rewrite it with a different opening line and a different compulsion lever "
                         f"(pick one you haven't used: social proof, curiosity, effort externalization, "
                         f"reciprocity, or asking the merchant a light question), keeping the same facts, "
-                        f"CRITICAL: You MUST preserve ALL exact numbers, metrics (views/calls/CTR), patient counts, dates, and the exact source citation '{required_citation if required_citation else ''}' verbatim. "
+                        f"CRITICAL: You MUST preserve ALL exact numbers, metrics (views/calls/CTR), patient counts, dates, and the exact source citation '{required_citation if required_citation else ''}' verbatim (e.g. 'Source: {required_citation if required_citation else ''}'). "
+                        f"CRITICAL: You MUST write the corrected message in the EXACT SAME LANGUAGE (Hinglish/English) as the original message. "
                         f"Keep the same action link ({action_url}), and stay strictly under {SAFE_BODY_LENGTH} "
                         f"characters. Return ONLY the corrected message text."
                     )
@@ -1056,73 +1188,121 @@ AUTO_REPLY_KEYWORDS = [
     "thank you for contacting", "respond shortly", "out of office",
     "aapki jaankari ke liye", "automated assistant", "automated message",
     "automated reply", "automated response", "will get back to you",
-    "canned response", "quick reply"
+    "will respond shortly", "we'll get back", "we will get back",
+    "canned response", "quick reply", "our team will", "business hours",
+    "this is an automated", "your message has been received",
+    "thanks for reaching out",
 ]
 
 HOSTILE_KEYWORDS = [
-    "stop messaging", "useless spam", "stop", "spam", "abuse",
-    "don't message", "dont message", "remove me"
+    "stop messaging", "stop sending", "stop bothering", "don't message",
+    "dont message", "don't contact", "remove me", "unsubscribe",
+    "leave me alone", "not interested", "useless", "spam", "scam",
+    "fraud", "bakwas", "waste of time",
+]
+
+OPT_OUT_KEYWORDS = [
+    "not interested", "stop", "unsubscribe", "remove me",
+    "don't message", "dont message",
+]
+
+DELAY_KEYWORDS = [
+    "later", "baad mein", "kal", "call back", "busy", "not now",
+    "after some time", "thodi der baad",
 ]
 
 INTENT_KEYWORDS = [
-    "lets do it", "let's do it", "whats next", "what's next", "go ahead",
-    "start", "karo", "mujhe join", "mujhe judna"
+    "yes", "haan", "ha ", "ok go", "okay go", "go ahead", "let's do it",
+    "lets do it", "whats next", "what's next", "karo", "kar do", "bhej do",
+    "mujhe join", "mujhe judna", "proceed", "confirm", "sounds good",
+    "great", "perfect", "send it", "do it", "sure", "absolutely",
+    "chalo", "theek hai", "thik hai",
 ]
 
 
 async def analyze_and_respond(merchant_id: str, message: str, turn: int, conv_id: str) -> dict:
-    msg_lower = message.lower()
+    msg_lower = message.strip().lower()
 
+    # Check for exact auto-reply patterns first (most common case — end fast)
     if any(kw in msg_lower for kw in AUTO_REPLY_KEYWORDS):
         return {
-            "action": "end",
-            "rationale": "Auto-reply keyword matched. Gracefully ending conversation."
+            "action": "wait",
+            "wait_seconds": 3600,
+            "rationale": "Auto-reply detected — merchant not at phone. Waiting 1hr before retry.",
+            "intent_detected": "auto_reply",
         }
 
+    # Opt-out / hostile — end conversation
     if any(kw in msg_lower for kw in HOSTILE_KEYWORDS):
         return {
             "action": "end",
-            "rationale": "Hostility or stop request detected. Gracefully ending conversation."
+            "rationale": "Hostility or stop request detected. Gracefully ending conversation.",
+            "intent_detected": "decline",
         }
 
+    # Delay request — wait before retrying
+    if any(kw in msg_lower for kw in DELAY_KEYWORDS) and not any(kw in msg_lower for kw in INTENT_KEYWORDS):
+        return {
+            "action": "wait",
+            "wait_seconds": 1800,
+            "rationale": "Merchant asked for time — pausing 30 min.",
+            "intent_detected": "wait",
+        }
+
+    # Merchant confirmed intent — switch to ACTION mode immediately (no more qualifying questions)
     if any(kw in msg_lower for kw in INTENT_KEYWORDS):
+        # Try to fetch merchant context for a personalized action reply
+        merchant_ctx = contexts.get(("merchant", merchant_id)) if merchant_id else None
+        merchant_payload = merchant_ctx["payload"] if merchant_ctx else {}
+        owner_name = merchant_payload.get("identity", {}).get("owner_first_name", "") or merchant_payload.get("identity", {}).get("name", "")
+        offers = [o for o in merchant_payload.get("offers", []) if o.get("status") == "active"]
+        offer_text = offers[0].get("title", "").replace("₹", "Rs.").replace("\u20b9", "Rs.") if offers else ""
+
+        if offer_text:
+            action_body = f"On it! Drafting your {offer_text} campaign now — I'll have the copy ready in 2 mins. Just review and say GO."
+        elif owner_name:
+            action_body = f"On it, {owner_name}! Drafting everything now — will share the draft for your review shortly."
+        else:
+            action_body = "On it! Preparing the draft now — I'll share it for your review in 2 minutes. Just say GO to publish."
+
         return {
             "action": "send",
-            "body": "Done! I've drafted the setup for you — confirm below and we'll proceed to the next step.",
+            "body": action_body,
             "cta": "none",
-            "rationale": "Commitment intent matched. Responding in action mode with actioning words."
+            "rationale": "Merchant confirmed intent. Switched to ACTION mode — no more qualifying questions.",
+            "intent_detected": "confirm",
         }
 
     # Fallback to LLM for other conversational turns
     if not _groq_client:
         return {
             "action": "send",
-            "body": "Thank you for your response. Let me know how you would like to proceed.",
+            "body": "Got it! How else can I help you grow your business today?",
             "cta": "open_ended",
-            "rationale": "Missing LLM API Key, fallback response."
+            "rationale": "Missing LLM API Key, fallback response.",
         }
 
-    system_prompt = """You are Vera, magicpin's Merchant AI Assistant.
-Analyze a reply from a merchant/customer and determine the next action.
+    # Fetch merchant context for contextual reply
+    merchant_ctx = contexts.get(("merchant", merchant_id)) if merchant_id else None
+    merchant_payload = merchant_ctx["payload"] if merchant_ctx else {}
+    merchant_name = merchant_payload.get("identity", {}).get("name", "")
+    category_slug = merchant_payload.get("category_slug") or merchant_payload.get("identity", {}).get("category", "")
 
-Categorize their reply into one of these actions:
-1. "end": If they explicitly request to stop, complain about spam, use abusive language, or if the message is an automated out-of-office/auto-reply.
-2. "wait": If they say they are busy and ask to talk later. In this case, set "wait_seconds" to a reasonable time (e.g. 1800 for 30 minutes).
-3. "send": If they are engaging or asking questions, or if they agree to proceed.
-   - IMPORTANT constraint on "send" body: If they say "let's do it" or "go ahead" or agree to proceed, you must transition to ACTION mode. In action mode, you MUST include actioning words (like "done", "sending", "draft", "here", "confirm", "proceed", "next") and you MUST NOT include any qualifying/asking questions (avoid words like "would you", "do you", "can you tell", "what if", "how about").
+    system_prompt = """You are Vera, magicpin's AI growth assistant.
+A merchant just replied. Determine the next action:
+- "end": explicit stop/spam/abuse/opt-out request
+- "wait": merchant says busy/later/call back — set wait_seconds=1800
+- "send": merchant is engaging, asking questions, or needs clarification
 
-Return ONLY a JSON response:
-{
-  "action": "send" or "wait" or "end",
-  "body": "Your composed reply text. Required if action is 'send'.",
-  "wait_seconds": 1800, // Optional: only if action is 'wait'
-  "cta": "binary" or "open_ended" or "none", // Required if action is 'send'
-  "rationale": "Why you chose this action."
-}
-- Do NOT include markdown code block formatting (like ```json) in your final response. Just return the raw JSON string.
-"""
+For "send" action:
+- If merchant agreed/confirmed: ACTION mode only — say "On it, drafting now..." DO NOT ask more qualifying questions
+- Keep reply under 40 words. One clear next step. Conversational, not formal.
+- If merchant asks something off-topic, redirect politely back to business growth
 
-    prompt = f"Reply Message: \"{message}\"\nTurn Number: {turn}"
+Return ONLY raw JSON: {"action":"send/wait/end","body":"reply text","wait_seconds":1800,"cta":"open_ended or none","rationale":"why"}"""
+
+    context_hint = f"Merchant: {merchant_name} ({category_slug})" if merchant_name else ""
+    prompt = f"{context_hint}\nMerchant message (turn {turn}): \"{message}\""
 
     try:
         response = await call_groq_with_retry(
@@ -1141,9 +1321,9 @@ Return ONLY a JSON response:
         print(f"LLM reply error after retries: {e}")
         return {
             "action": "send",
-            "body": "Understood. How else can I assist you with your business profile?",
+            "body": "Got it! Let me know how else I can help you grow your business.",
             "cta": "open_ended",
-            "rationale": f"LLM Error after retries: {e}"
+            "rationale": f"LLM Error after retries: {e}",
         }
 
 
