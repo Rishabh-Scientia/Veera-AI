@@ -16,12 +16,14 @@ import re
 import logging
 from typing import Optional
 
+from google import genai
+from google.genai import types as genai_types
 from dotenv import load_dotenv
 
 load_dotenv()
 logger = logging.getLogger("vera.reply")
 
-LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # ── Auto-reply detection ──────────────────────────────────────────────────────
 
@@ -177,18 +179,13 @@ def _llm_reply(
     from_role: str,
     mode: str = "continue",
 ) -> dict:
-    if not LLM_API_KEY:
+    if not GEMINI_API_KEY:
         return None  # Signal caller to use fallback
 
     try:
-        import urllib.request
-        import json
-        import ssl
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
+        client = genai.Client(api_key=GEMINI_API_KEY)
         system = CUSTOMER_REPLY_SYSTEM if from_role == "customer" else MERCHANT_REPLY_SYSTEM
+
         hist_str = json.dumps(history[-6:], ensure_ascii=False, indent=2) if history else "[]"
         merch_str = json.dumps(merchant_ctx, ensure_ascii=False, indent=2) if merchant_ctx else "{}"
         cat_str = json.dumps({"voice": category_ctx.get("voice", {}), "peer_stats": category_ctx.get("peer_stats", {})}, ensure_ascii=False) if category_ctx else "{}"
@@ -204,23 +201,16 @@ INCOMING MESSAGE: {message}
 
 Reply as instructed. Return ONLY valid JSON."""
 
-        req = urllib.request.Request(
-            "https://api.groq.com/openai/v1/chat/completions",
-            data=json.dumps({
-                "model": "llama-3.3-70b-versatile",
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_prompt}
-                ],
-                "temperature": 0.4,
-                "max_tokens": 400,
-                "response_format": {"type": "json_object"}
-            }).encode("utf-8"),
-            headers={"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=user_prompt,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=system,
+                temperature=0.4,
+                max_output_tokens=400,
+            ),
         )
-        response = urllib.request.urlopen(req, timeout=45, context=ctx)
-        data = json.loads(response.read().decode("utf-8"))
-        raw = data["choices"][0]["message"]["content"].strip()
+        raw = response.text.strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
         parsed = json.loads(raw)
@@ -386,7 +376,7 @@ def handle_reply(
     # ── CUSTOMER ROLE: completely separate path ───────────────────────────────
     if from_role == "customer":
         # Try LLM first
-        if LLM_API_KEY:
+        if GEMINI_API_KEY:
             llm = _llm_reply(message, conversation_history, merchant_ctx, category_ctx, customer_ctx, from_role="customer")
             if llm and not llm.get("_rate_limited"):
                 return llm
@@ -428,7 +418,7 @@ def handle_reply(
 
     # 3. Intent action — execute immediately, skip re-qualification
     if _is_intent_action(message):
-        if LLM_API_KEY:
+        if GEMINI_API_KEY:
             llm = _llm_reply(message, conversation_history, merchant_ctx, category_ctx, None, from_role="merchant", mode="execute_intent")
             if llm and not llm.get("_rate_limited"):
                 return llm
@@ -462,7 +452,7 @@ def handle_reply(
         }
 
     # 5. LLM for everything else
-    if LLM_API_KEY:
+    if GEMINI_API_KEY:
         llm = _llm_reply(message, conversation_history, merchant_ctx, category_ctx, None, from_role="merchant", mode="continue")
         if llm and not llm.get("_rate_limited"):
             return llm

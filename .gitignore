@@ -1,7 +1,10 @@
-.env
 __pycache__/
-chatbot2/
-debug.log
-bot.py
+*.pyc
+*.pyo
+.env
+*.log
+test_log.txt
 
-judge_simulator.py
+judge_results.txt
+test_log.txt
+*.txt

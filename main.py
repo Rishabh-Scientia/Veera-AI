@@ -1,5 +1,5 @@
 """
-main.py — Rishabh Bot HTTP server.
+main.py — Vera Bot HTTP server.
 Exposes: GET /v1/healthz, GET /v1/metadata, POST /v1/context, POST /v1/tick, POST /v1/reply
 """
 
@@ -144,7 +144,7 @@ async def homepage():
   <div class="logo">🤖</div>
   <h1>Vera Bot</h1>
   <p class="subtitle">magicpin AI Challenge — Merchant Intelligence Engine</p>
-  <div class="badge"><span class="ping"></span>LIVE · Groq LLM · 30/30 Tests Passing</div>
+  <div class="badge"><span class="ping"></span>LIVE · Gemini 2.0 Flash · 30/30 Tests Passing</div>
 </div>
 
 <div class="container">
@@ -312,8 +312,8 @@ async def healthz():
 @app.get("/v1/metadata")
 async def metadata():
     return {
-        "team_name": os.getenv("TEAM_NAME", "RishabhBot"),
-        "team_members": [os.getenv("TEAM_MEMBER", "Rishabh Yadav")],
+        "team_name": os.getenv("TEAM_NAME", "VeraBot"),
+        "team_members": [os.getenv("TEAM_MEMBER", "Shreyansh")],
         "model": "gemini-2.0-flash",
         "approach": (
             "Trigger-routed LLM composer using Gemini 2.0 Flash. "
@@ -321,7 +321,7 @@ async def metadata():
             "All 25 trigger kinds handled with data-grounded, specific messages. "
             "Rule-based fast paths for auto-reply, opt-out, and intent transitions."
         ),
-        "contact_email": os.getenv("CONTACT_EMAIL", "scientiarishabh@gmail.com"),
+        "contact_email": os.getenv("CONTACT_EMAIL", "shreyanshjaiswal2002@gmail.com"),
         "version": "1.0.0",
         "submitted_at": "2026-04-29T14:00:00Z",
     }
@@ -387,8 +387,7 @@ async def tick(body: TickBody):
         if expires_at:
             try:
                 exp_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-                now_dt = datetime.fromisoformat(body.now.replace("Z", "+00:00"))
-                if now_dt > exp_dt:
+                if datetime.now(timezone.utc) > exp_dt:
                     logger.info(f"Trigger expired: {trg_id}")
                     continue
             except Exception:

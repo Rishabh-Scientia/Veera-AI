@@ -37,11 +37,18 @@ Rule-based fast paths (O(1), no LLM needed):
 4. **Stateful in-memory** — Contexts + conversations persist across calls (no restarts during test).
 5. **Teardown** — `POST /v1/teardown` wipes all state cleanly.
 
+## What additional context would have helped
+
+- **Conversation history format** from production Vera — knowing how past turns were encoded would let me use richer history.
+- **Merchant reply distribution** — knowing the % of auto-replies vs real replies helps tune fast-path thresholds.
+- **Category-specific offer pricing ranges** — to generate more grounded offers for the fallback composer.
+
 ## Running locally
 
 ```bash
 pip install -r requirements.txt
-# Add your LLM_API_KEY to .env
+cp .env.example .env
+# Add your GEMINI_API_KEY to .env
 python main.py
 ```
 
@@ -67,7 +74,9 @@ python -m uvicorn main:app --host 0.0.0.0 --port 8080
 ├── main.py          # FastAPI server, all 5 endpoints
 ├── composer.py      # LLM message composer (Gemini 2.0 Flash)
 ├── reply_handler.py # Multi-turn reply handler
+├── test_bot.py      # Local integration test
 ├── requirements.txt
-├── Procfile         # Railway startup command
-└── README.md
+├── Dockerfile       # Railway deployment
+├── railway.json     # Railway config
+└── .env.example
 ```
