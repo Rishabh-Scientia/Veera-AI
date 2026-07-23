@@ -226,6 +226,18 @@ def _validate_and_fix(result: dict, trigger: dict) -> dict:
     return result
 
 
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("LLM_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL") or os.getenv("LLM_MODEL") or "llama-3.3-70b-versatile"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+MODEL_NAME = "gemini-2.0-flash"
+
+try:
+    from groq import Groq
+    HAS_GROQ = True
+except ImportError:
+    HAS_GROQ = False
+
+
 def compose(
     category: dict,
     merchant: dict,
@@ -234,36 +246,56 @@ def compose(
 ) -> dict:
     """
     Core composition function.
+    Supports Groq AI (llama-3.3-70b-versatile), Gemini 2.0 Flash, and deterministic fallback.
     Returns: {body, cta, send_as, suppression_key, rationale}
     """
-    if not GEMINI_API_KEY:
-        # Fallback deterministic composer if no API key
-        return _fallback_compose(category, merchant, trigger, customer)
+    prompt = _build_prompt(category, merchant, trigger, customer)
 
-    try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        prompt = _build_prompt(category, merchant, trigger, customer)
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
+    # 1. Try Groq AI if key is available
+    if GROQ_API_KEY and HAS_GROQ:
+        try:
+            client = Groq(api_key=GROQ_API_KEY)
+            response = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}
+                ],
                 temperature=0.3,
-                max_output_tokens=600,
-                response_mime_type="application/json",
-            ),
-        )
-        text = response.text.strip()
+                max_tokens=600,
+                response_format={"type": "json_object"}
+            )
+            text = response.choices[0].message.content.strip()
+            result = json.loads(text)
+            result["rationale"] = result.get("rationale", "") + f" [Groq: {GROQ_MODEL}]"
+            return _validate_and_fix(result, trigger)
+        except Exception as e:
+            logger.error(f"Groq LLM composition failed: {e}")
 
-        # Parse JSON
-        if "```" in text:
-            text = re.sub(r"```[a-z]*\n?", "", text).replace("```", "").strip()
-        result = json.loads(text)
-        return _validate_and_fix(result, trigger)
+    # 2. Try Gemini Flash if key is available
+    if GEMINI_API_KEY:
+        try:
+            client = genai.Client(api_key=GEMINI_API_KEY)
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    temperature=0.3,
+                    max_output_tokens=600,
+                    response_mime_type="application/json",
+                ),
+            )
+            text = response.text.strip()
+            if "```" in text:
+                text = re.sub(r"```[a-z]*\n?", "", text).replace("```", "").strip()
+            result = json.loads(text)
+            return _validate_and_fix(result, trigger)
+        except Exception as e:
+            logger.error(f"Gemini LLM composition failed: {e}")
 
-    except Exception as e:
-        logger.error(f"LLM composition failed: {e}")
-        return _fallback_compose(category, merchant, trigger, customer)
+    # 3. Rule-based fallback
+    return _fallback_compose(category, merchant, trigger, customer)
 
 
 def _fallback_compose(

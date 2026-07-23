@@ -168,6 +168,16 @@ def _get_last_vera_topic(history: list) -> str:
     return "your magicpin growth"
 
 
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("LLM_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL") or os.getenv("LLM_MODEL") or "llama-3.3-70b-versatile"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+try:
+    from groq import Groq
+    HAS_GROQ = True
+except ImportError:
+    HAS_GROQ = False
+
 # ── LLM reply ────────────────────────────────────────────────────────────────
 
 def _llm_reply(
@@ -179,19 +189,13 @@ def _llm_reply(
     from_role: str,
     mode: str = "continue",
 ) -> dict:
-    if not GEMINI_API_KEY:
-        return None  # Signal caller to use fallback
+    system = CUSTOMER_REPLY_SYSTEM if from_role == "customer" else MERCHANT_REPLY_SYSTEM
+    hist_str = json.dumps(history[-6:], ensure_ascii=False, indent=2) if history else "[]"
+    merch_str = json.dumps(merchant_ctx, ensure_ascii=False, indent=2) if merchant_ctx else "{}"
+    cat_str = json.dumps({"voice": category_ctx.get("voice", {}), "peer_stats": category_ctx.get("peer_stats", {})}, ensure_ascii=False) if category_ctx else "{}"
+    cust_str = json.dumps(customer_ctx, ensure_ascii=False, indent=2) if customer_ctx else "{}"
 
-    try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        system = CUSTOMER_REPLY_SYSTEM if from_role == "customer" else MERCHANT_REPLY_SYSTEM
-
-        hist_str = json.dumps(history[-6:], ensure_ascii=False, indent=2) if history else "[]"
-        merch_str = json.dumps(merchant_ctx, ensure_ascii=False, indent=2) if merchant_ctx else "{}"
-        cat_str = json.dumps({"voice": category_ctx.get("voice", {}), "peer_stats": category_ctx.get("peer_stats", {})}, ensure_ascii=False) if category_ctx else "{}"
-        cust_str = json.dumps(customer_ctx, ensure_ascii=False, indent=2) if customer_ctx else "{}"
-
-        user_prompt = f"""MODE: {mode}
+    user_prompt = f"""MODE: {mode}
 FROM_ROLE: {from_role}
 MERCHANT CONTEXT: {merch_str}
 CATEGORY CONTEXT: {cat_str}
@@ -201,37 +205,58 @@ INCOMING MESSAGE: {message}
 
 Reply as instructed. Return ONLY valid JSON."""
 
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=user_prompt,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=system,
+    # 1. Try Groq AI
+    if GROQ_API_KEY and HAS_GROQ:
+        try:
+            client = Groq(api_key=GROQ_API_KEY)
+            response = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_prompt}
+                ],
                 temperature=0.4,
-                max_output_tokens=400,
-            ),
-        )
-        raw = response.text.strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-        parsed = json.loads(raw)
+                max_tokens=400,
+                response_format={"type": "json_object"}
+            )
+            raw = response.choices[0].message.content.strip()
+            parsed = json.loads(raw)
+            if "body" in parsed and len(parsed["body"]) > 320:
+                parsed["body"] = parsed["body"][:317] + "..."
+            if "body" in parsed:
+                parsed["body"] = re.sub(r"https?://\S+", "", parsed["body"]).strip()
+            parsed["rationale"] = parsed.get("rationale", "") + f" [Groq: {from_role} mode={mode}]"
+            return parsed
+        except Exception as e:
+            logger.warning(f"Groq reply failed: {e}")
 
-        # Validate body length
-        if "body" in parsed and len(parsed["body"]) > 320:
-            parsed["body"] = parsed["body"][:317] + "..."
+    # 2. Try Gemini
+    if GEMINI_API_KEY:
+        try:
+            client = genai.Client(api_key=GEMINI_API_KEY)
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=user_prompt,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=system,
+                    temperature=0.4,
+                    max_output_tokens=400,
+                ),
+            )
+            raw = response.text.strip()
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            parsed = json.loads(raw)
+            if "body" in parsed and len(parsed["body"]) > 320:
+                parsed["body"] = parsed["body"][:317] + "..."
+            if "body" in parsed:
+                parsed["body"] = re.sub(r"https?://\S+", "", parsed["body"]).strip()
+            parsed["rationale"] = parsed.get("rationale", "") + f" [LLM: {from_role} mode={mode}]"
+            return parsed
+        except Exception as e:
+            logger.warning(f"Gemini reply failed: {e}")
 
-        # Remove URLs
-        if "body" in parsed:
-            parsed["body"] = re.sub(r"https?://\S+", "", parsed["body"]).strip()
-
-        parsed["rationale"] = parsed.get("rationale", "") + f" [LLM: {from_role} mode={mode}]"
-        return parsed
-
-    except Exception as e:
-        err = str(e)[:60]
-        logger.warning(f"LLM reply failed: {err}")
-        if "429" in err or "RESOURCE_EXHAUSTED" in err:
-            return {"_rate_limited": True}
-        return None
+    return None
 
 
 # ── Customer-role fallback responses ─────────────────────────────────────────

@@ -314,9 +314,9 @@ async def metadata():
     return {
         "team_name": os.getenv("TEAM_NAME", "VeraBot"),
         "team_members": [os.getenv("TEAM_MEMBER", "Shreyansh")],
-        "model": "gemini-2.0-flash",
+        "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
         "approach": (
-            "Trigger-routed LLM composer using Gemini 2.0 Flash. "
+            "Trigger-routed LLM composer using Groq AI (llama-3.3-70b-versatile). "
             "4-context architecture (Category, Merchant, Trigger, Customer). "
             "All 25 trigger kinds handled with data-grounded, specific messages. "
             "Rule-based fast paths for auto-reply, opt-out, and intent transitions."

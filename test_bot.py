@@ -119,7 +119,7 @@ trg = {
         "merchant_id": "m_001_drmeera_dentist_delhi", "customer_id": None,
         "payload": {"category": "dentists", "top_item_id": "d_2026W17_jida_fluoride"},
         "urgency": 2, "suppression_key": "research:dentists:2026-W17",
-        "expires_at": "2026-05-10T00:00:00Z"
+        "expires_at": "2028-05-10T00:00:00Z"
     }
 }
 s, r = post("/v1/context", trg)
